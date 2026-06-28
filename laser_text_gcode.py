@@ -113,9 +113,9 @@ class LaserPreview(QWidget):
         grid_pen = QPen(QColor(214, 219, 226), 0)
         painter.setPen(grid_pen)
         for x in range(0, int(self.work_width) + 1, 5):
-            painter.drawLine(x, 0, x, self.work_height)
+            painter.drawLine(QPointF(float(x), 0.0), QPointF(float(x), self.work_height))
         for y in range(0, int(self.work_height) + 1, 5):
-            painter.drawLine(0, y, self.work_width, y)
+            painter.drawLine(QPointF(0.0, float(y)), QPointF(self.work_width, float(y)))
 
         border_pen = QPen(QColor(46, 52, 64), 0)
         border_pen.setWidthF(0)
@@ -125,8 +125,8 @@ class LaserPreview(QWidget):
         axis_pen = QPen(QColor(35, 130, 95), 0)
         axis_pen.setDashPattern([2, 2])
         painter.setPen(axis_pen)
-        painter.drawLine(0, 0, min(20.0, self.work_width), 0)
-        painter.drawLine(0, 0, 0, min(20.0, self.work_height))
+        painter.drawLine(QPointF(0.0, 0.0), QPointF(min(20.0, self.work_width), 0.0))
+        painter.drawLine(QPointF(0.0, 0.0), QPointF(0.0, min(20.0, self.work_height)))
 
     def draw_text_items(self, painter):
         for index, item in enumerate(self.items):
