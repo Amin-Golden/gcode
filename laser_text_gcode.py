@@ -3,7 +3,7 @@ import time
 from dataclasses import dataclass
 
 from PyQt6.QtCore import QPointF, QRectF, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QFontDatabase, QPainter, QPainterPath, QPen
+from PyQt6.QtGui import QColor, QFont, QFontDatabase, QFontMetricsF, QPainter, QPainterPath, QPen, QTextLayout, QTextOption
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -26,8 +26,35 @@ from PyQt6.QtWidgets import (
 
 try:
     import serial
+    from serial.tools import list_ports
 except ImportError:
     serial = None
+    list_ports = None
+
+
+PERSIAN_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+PERSIAN_LETTERS = set("اآبپتثجچحخدذرزژسشصضطظعغفقکگلمنوهیيكة")
+NUMERIC_KEYS = {"card_number", "expiry", "cvv2"}
+PERSIAN_DISPLAY_FONT = "B Nazanin"
+NUMERIC_DISPLAY_FONT = "Calibri"
+STANDARD_BAUD_RATES = [
+    300,
+    600,
+    1200,
+    2400,
+    4800,
+    9600,
+    14400,
+    19200,
+    38400,
+    57600,
+    115200,
+    128000,
+    230400,
+    250000,
+    500000,
+    1000000,
+]
 
 
 @dataclass
@@ -39,13 +66,188 @@ class TextItem:
     y: float
 
 
+class StrokeFont:
+    """Single-line laser font styled after B Nazanin and Calibri."""
+
+    def __init__(self):
+        self.advance = 1.08
+        self.space = 0.52
+        self.glyphs = self.build_glyphs()
+
+    @staticmethod
+    def curve(p0, p1, p2, p3, steps=8):
+        points = []
+        for index in range(steps + 1):
+            t = index / steps
+            mt = 1.0 - t
+            x = mt**3 * p0[0] + 3 * mt**2 * t * p1[0] + 3 * mt * t**2 * p2[0] + t**3 * p3[0]
+            y = mt**3 * p0[1] + 3 * mt**2 * t * p1[1] + 3 * mt * t**2 * p2[1] + t**3 * p3[1]
+            points.append((x, y))
+        return points
+
+    @staticmethod
+    def join(*parts):
+        points = []
+        for part in parts:
+            if points and part and points[-1] == part[0]:
+                points.extend(part[1:])
+            else:
+                points.extend(part)
+        return points
+
+    def build_glyphs(self):
+        c = self.curve
+        j = self.join
+
+        glyphs = {
+            "0": [j(c((0.5, 1.0), (0.88, 0.98), (0.88, 0.02), (0.5, 0.0)), c((0.5, 0.0), (0.12, 0.02), (0.12, 0.98), (0.5, 1.0)))],
+            "1": [[(0.34, 0.74), (0.52, 1.0), (0.52, 0.0)], [(0.35, 0.0), (0.72, 0.0)]],
+            "2": [j(c((0.18, 0.78), (0.34, 1.08), (0.88, 1.02), (0.82, 0.66)), c((0.82, 0.66), (0.78, 0.42), (0.36, 0.3), (0.18, 0.0)), [(0.18, 0.0), (0.86, 0.0)])],
+            "3": [j(c((0.2, 0.88), (0.42, 1.05), (0.86, 0.94), (0.66, 0.56)), c((0.66, 0.56), (0.98, 0.42), (0.78, -0.08), (0.22, 0.08)))],
+            "4": [[(0.78, 0.0), (0.78, 1.0)], [(0.78, 0.46), (0.16, 0.46), (0.66, 1.0)]],
+            "5": [j([(0.82, 1.0), (0.28, 1.0), (0.22, 0.58)], c((0.22, 0.58), (0.94, 0.74), (0.94, -0.04), (0.24, 0.08)))],
+            "6": [j(c((0.78, 0.92), (0.22, 0.9), (0.08, 0.1), (0.54, 0.02)), c((0.54, 0.02), (0.96, 0.12), (0.86, 0.62), (0.42, 0.54)), c((0.42, 0.54), (0.18, 0.48), (0.22, 0.16), (0.54, 0.02)))],
+            "7": [[(0.16, 1.0), (0.86, 1.0), (0.34, 0.0)]],
+            "8": [j(c((0.5, 1.0), (0.92, 0.94), (0.82, 0.54), (0.5, 0.5)), c((0.5, 0.5), (0.18, 0.46), (0.08, 0.06), (0.5, 0.0)), c((0.5, 0.0), (0.92, 0.06), (0.82, 0.46), (0.5, 0.5)), c((0.5, 0.5), (0.18, 0.54), (0.08, 0.94), (0.5, 1.0)))],
+            "9": [j(c((0.24, 0.08), (0.78, 0.1), (0.92, 0.9), (0.46, 0.98)), c((0.46, 0.98), (0.04, 0.88), (0.14, 0.38), (0.58, 0.46)), c((0.58, 0.46), (0.84, 0.52), (0.78, 0.84), (0.46, 0.98)))],
+        }
+        glyphs.update(
+            {
+                "/": [c((0.22, 0.0), (0.34, 0.32), (0.66, 0.68), (0.78, 1.0), steps=5)],
+                "-": [[(0.24, 0.5), (0.76, 0.5)]],
+                ".": [[(0.45, 0.0), (0.55, 0.0)]],
+                ":": [[(0.45, 0.25), (0.55, 0.25)], [(0.45, 0.75), (0.55, 0.75)]],
+                "A": [[(0.12, 0.0), (0.5, 1.0), (0.88, 0.0)], [(0.28, 0.42), (0.72, 0.42)]],
+                "B": [[(0.18, 0.0), (0.18, 1.0)], j(c((0.18, 1.0), (0.9, 0.98), (0.9, 0.54), (0.18, 0.5)), c((0.18, 0.5), (0.92, 0.48), (0.92, 0.02), (0.18, 0.0)))],
+                "C": [c((0.86, 0.86), (0.54, 1.08), (0.1, 0.78), (0.12, 0.48)) + c((0.12, 0.48), (0.14, 0.12), (0.54, -0.08), (0.86, 0.12))[1:]],
+                "D": [[(0.18, 0.0), (0.18, 1.0)], c((0.18, 1.0), (0.9, 0.92), (0.98, 0.1), (0.18, 0.0))],
+                "E": [[(0.82, 1.0), (0.18, 1.0), (0.18, 0.0), (0.82, 0.0)], [(0.18, 0.5), (0.66, 0.5)]],
+                "F": [[(0.18, 0.0), (0.18, 1.0), (0.82, 1.0)], [(0.18, 0.5), (0.66, 0.5)]],
+                "I": [[(0.5, 0.0), (0.5, 1.0)], [(0.28, 1.0), (0.72, 1.0)], [(0.28, 0.0), (0.72, 0.0)]],
+                "L": [[(0.18, 1.0), (0.18, 0.0), (0.82, 0.0)]],
+                "M": [[(0.12, 0.0), (0.12, 1.0), (0.5, 0.38), (0.88, 1.0), (0.88, 0.0)]],
+                "N": [[(0.16, 0.0), (0.16, 1.0), (0.84, 0.0), (0.84, 1.0)]],
+                "O": [j(c((0.5, 1.0), (0.88, 0.98), (0.88, 0.02), (0.5, 0.0)), c((0.5, 0.0), (0.12, 0.02), (0.12, 0.98), (0.5, 1.0)))],
+                "R": [[(0.18, 0.0), (0.18, 1.0)], c((0.18, 1.0), (0.9, 0.94), (0.86, 0.46), (0.18, 0.5)), [(0.44, 0.5), (0.9, 0.0)]],
+                "S": [j(c((0.84, 0.86), (0.5, 1.08), (0.12, 0.8), (0.24, 0.56)), c((0.24, 0.56), (0.34, 0.38), (0.88, 0.42), (0.76, 0.12)), c((0.76, 0.12), (0.5, -0.08), (0.18, 0.02), (0.12, 0.16)))],
+                "T": [[(0.12, 1.0), (0.88, 1.0)], [(0.5, 1.0), (0.5, 0.0)]],
+                "V": [[(0.12, 1.0), (0.5, 0.0), (0.88, 1.0)]],
+                "X": [[(0.14, 0.0), (0.86, 1.0)], [(0.14, 1.0), (0.86, 0.0)]],
+            }
+        )
+
+        # Elegant single-line Persian skeletons for engraving, not filled font outlines.
+        dot1 = c((0.44, 1.13), (0.47, 1.17), (0.53, 1.17), (0.56, 1.13), steps=3)
+        dot2 = [c((0.33, 1.13), (0.36, 1.17), (0.42, 1.17), (0.45, 1.13), steps=3), c((0.56, 1.13), (0.59, 1.17), (0.65, 1.17), (0.68, 1.13), steps=3)]
+        dot3 = [
+            c((0.29, 1.12), (0.32, 1.16), (0.38, 1.16), (0.41, 1.12), steps=3),
+            c((0.49, 1.26), (0.52, 1.3), (0.58, 1.3), (0.61, 1.26), steps=3),
+            c((0.69, 1.12), (0.72, 1.16), (0.78, 1.16), (0.81, 1.12), steps=3),
+        ]
+        low_dot1 = c((0.44, -0.18), (0.47, -0.14), (0.53, -0.14), (0.56, -0.18), steps=3)
+        low_dot2 = [c((0.33, -0.18), (0.36, -0.14), (0.42, -0.14), (0.45, -0.18), steps=3), c((0.56, -0.18), (0.59, -0.14), (0.65, -0.14), (0.68, -0.18), steps=3)]
+        low_dot3 = [
+            c((0.29, -0.18), (0.32, -0.14), (0.38, -0.14), (0.41, -0.18), steps=3),
+            c((0.49, -0.32), (0.52, -0.28), (0.58, -0.28), (0.61, -0.32), steps=3),
+            c((0.69, -0.18), (0.72, -0.14), (0.78, -0.14), (0.81, -0.18), steps=3),
+        ]
+
+        base = c((0.12, 0.2), (0.34, -0.02), (0.66, -0.02), (0.9, 0.2), steps=7)
+        cup = c((0.1, 0.42), (0.28, 0.02), (0.68, -0.06), (0.92, 0.28), steps=7)
+        tall = c((0.5, 0.0), (0.48, 0.34), (0.5, 0.72), (0.5, 1.08), steps=5)
+        hook = j(c((0.86, 0.68), (0.58, 1.0), (0.16, 0.78), (0.22, 0.48), steps=6), c((0.22, 0.48), (0.34, 0.28), (0.62, 0.32), (0.82, 0.38), steps=5))
+        tail = c((0.84, 0.34), (0.62, 0.04), (0.32, -0.02), (0.14, 0.12), steps=7)
+
+        glyphs.update(
+            {
+                "ا": [tall],
+                "آ": [tall, [(0.28, 1.18), (0.72, 1.28)]],
+                "ب": [base, low_dot1],
+                "پ": [base, *low_dot3],
+                "ت": [base, *dot2],
+                "ث": [base, *dot3],
+                "ج": [hook, tail, low_dot1],
+                "چ": [hook, tail, *low_dot3],
+                "ح": [hook, tail],
+                "خ": [hook, tail, dot1],
+                "د": [[(0.25, 0.82), (0.78, 0.52), (0.62, 0.18), (0.25, 0.18)]],
+                "ذ": [[(0.25, 0.82), (0.78, 0.52), (0.62, 0.18), (0.25, 0.18)], dot1],
+                "ر": [[(0.75, 0.78), (0.72, 0.35), (0.42, 0.02), (0.15, 0.1)]],
+                "ز": [[(0.75, 0.78), (0.72, 0.35), (0.42, 0.02), (0.15, 0.1)], dot1],
+                "ژ": [[(0.75, 0.78), (0.72, 0.35), (0.42, 0.02), (0.15, 0.1)], *dot3],
+                "س": [[(0.08, 0.42), (0.25, 0.15), (0.42, 0.42), (0.6, 0.15), (0.86, 0.42)]],
+                "ش": [[(0.08, 0.42), (0.25, 0.15), (0.42, 0.42), (0.6, 0.15), (0.86, 0.42)], *dot3],
+                "ص": [[(0.1, 0.2), (0.48, 0.05), (0.88, 0.18), (0.82, 0.58), (0.42, 0.62), (0.25, 0.34)]],
+                "ض": [[(0.1, 0.2), (0.48, 0.05), (0.88, 0.18), (0.82, 0.58), (0.42, 0.62), (0.25, 0.34)], dot1],
+                "ط": [[(0.16, 0.18), (0.86, 0.18), (0.72, 0.62), (0.3, 0.62), (0.16, 0.18)], tall],
+                "ظ": [[(0.16, 0.18), (0.86, 0.18), (0.72, 0.62), (0.3, 0.62), (0.16, 0.18)], tall, dot1],
+                "ع": [[(0.78, 0.82), (0.36, 0.82), (0.2, 0.56), (0.48, 0.42), (0.82, 0.32), (0.7, 0.05), (0.28, 0.02)]],
+                "غ": [[(0.78, 0.82), (0.36, 0.82), (0.2, 0.56), (0.48, 0.42), (0.82, 0.32), (0.7, 0.05), (0.28, 0.02)], dot1],
+                "ف": [[(0.1, 0.18), (0.82, 0.18), (0.78, 0.62), (0.45, 0.72), (0.32, 0.45), (0.55, 0.3)], dot1],
+                "ق": [[(0.1, 0.18), (0.82, 0.18), (0.78, 0.62), (0.45, 0.72), (0.32, 0.45), (0.55, 0.3)], *dot2],
+                "ک": [[(0.18, 0.0), (0.18, 1.0)], [(0.8, 0.86), (0.35, 0.46), (0.82, 0.12)]],
+                "گ": [[(0.18, 0.0), (0.18, 1.0)], [(0.8, 0.86), (0.35, 0.46), (0.82, 0.12)], [(0.42, 1.1), (0.82, 1.1)]],
+                "ل": [[(0.58, 1.0), (0.58, 0.22), (0.32, 0.0), (0.12, 0.15)]],
+                "م": [[(0.78, 0.62), (0.35, 0.62), (0.2, 0.25), (0.5, 0.05), (0.82, 0.25), (0.78, 0.62)]],
+                "ن": [cup, dot1],
+                "و": [[(0.25, 0.72), (0.72, 0.72), (0.82, 0.35), (0.52, 0.05), (0.18, 0.14)]],
+                "ه": [[(0.48, 0.75), (0.16, 0.48), (0.35, 0.12), (0.72, 0.18), (0.84, 0.54), (0.48, 0.75)]],
+                "ی": [cup, *low_dot2],
+            }
+        )
+        glyphs["ي"] = glyphs["ی"]
+        glyphs["ك"] = glyphs["ک"]
+        glyphs["ة"] = glyphs["ه"]
+        return glyphs
+
+    def normalize(self, text, numeric=False):
+        text = text.translate(PERSIAN_DIGITS)
+        text = text.replace("ي", "ی").replace("ك", "ک").replace("ة", "ه")
+        if numeric:
+            allowed = set("0123456789 /-:.")
+            return "".join(char for char in text if char in allowed)
+        return text
+
+    def visual_chars(self, text, numeric=False):
+        text = self.normalize(text, numeric=numeric)
+        if numeric:
+            return list(text)
+        if any(char in PERSIAN_LETTERS for char in text):
+            return list(reversed(text))
+        return list(text.upper())
+
+    def text_width(self, text, size, numeric=False):
+        chars = self.visual_chars(text, numeric=numeric)
+        width = 0.0
+        for char in chars:
+            width += self.space if char.isspace() else self.advance
+        return width * size
+
+    def strokes_for_text(self, text, x, y, size, numeric=False):
+        strokes = []
+        cursor = x
+        for char in self.visual_chars(text, numeric=numeric):
+            if char.isspace():
+                cursor += self.space * size
+                continue
+            glyph = self.glyphs.get(char.upper()) or self.glyphs.get(char)
+            if glyph is None:
+                glyph = [[(0.18, 0.0), (0.82, 1.0)], [(0.18, 1.0), (0.82, 0.0)]]
+            for stroke in glyph:
+                strokes.append([QPointF(cursor + px * size, y + py * size) for px, py in stroke])
+            cursor += self.advance * size
+        return strokes
+
+
 class LaserPreview(QWidget):
     itemMoved = pyqtSignal(int, float, float)
     itemSelected = pyqtSignal(int)
 
-    def __init__(self, items, font_factory, parent=None):
+    def __init__(self, items, stroke_font, size_getter, font_factory, parent=None):
         super().__init__(parent)
         self.items = items
+        self.stroke_font = stroke_font
+        self.size_getter = size_getter
         self.font_factory = font_factory
         self.work_width = 86.0
         self.work_height = 54.0
@@ -59,9 +261,6 @@ class LaserPreview(QWidget):
     def set_work_area(self, width, height):
         self.work_width = max(1.0, float(width))
         self.work_height = max(1.0, float(height))
-        self.update()
-
-    def update_preview(self):
         self.update()
 
     def set_selected_index(self, index):
@@ -79,20 +278,32 @@ class LaserPreview(QWidget):
         used_h = self.work_height * scale
         return QPointF((self.width() - used_w) / 2, (self.height() + used_h) / 2)
 
-    def machine_to_screen(self, point):
-        scale = self.scale_factor()
-        origin = self.origin()
-        return QPointF(origin.x() + point.x() * scale, origin.y() - point.y() * scale)
-
     def screen_to_machine(self, point):
         scale = self.scale_factor()
         origin = self.origin()
         return QPointF((point.x() - origin.x()) / scale, (origin.y() - point.y()) / scale)
 
-    def text_path(self, item):
-        path = QPainterPath()
-        path.addText(item.x, item.y, self.font_factory(), item.text)
-        return path
+    def machine_to_screen(self, point):
+        scale = self.scale_factor()
+        origin = self.origin()
+        return QPointF(origin.x() + point.x() * scale, origin.y() - point.y() * scale)
+
+    def preview_text(self, item):
+        return self.stroke_font.normalize(item.text, numeric=item.key in NUMERIC_KEYS)
+
+    def item_bounds(self, item):
+        text = self.preview_text(item)
+        if not text:
+            return QRectF(item.x - 1.0, item.y - 1.0, 2.0, 2.0)
+        ratio = self.screen_font_ratio()
+        font = self.font_factory(item, self.size_getter() * ratio)
+        metrics = QFontMetricsF(font)
+        width = metrics.horizontalAdvance(text) / ratio
+        height = metrics.height() / ratio
+        return QRectF(item.x, item.y - height * 0.78, width, height).normalized()
+
+    def screen_font_ratio(self):
+        return 20.0
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -100,9 +311,7 @@ class LaserPreview(QWidget):
         painter.fillRect(self.rect(), QColor(245, 246, 248))
 
         scale = self.scale_factor()
-        origin = self.origin()
-
-        painter.translate(origin)
+        painter.translate(self.origin())
         painter.scale(scale, -scale)
 
         self.draw_work_area(painter)
@@ -110,16 +319,13 @@ class LaserPreview(QWidget):
         painter.end()
 
     def draw_work_area(self, painter):
-        grid_pen = QPen(QColor(214, 219, 226), 0)
-        painter.setPen(grid_pen)
+        painter.setPen(QPen(QColor(214, 219, 226), 0))
         for x in range(0, int(self.work_width) + 1, 5):
             painter.drawLine(QPointF(float(x), 0.0), QPointF(float(x), self.work_height))
         for y in range(0, int(self.work_height) + 1, 5):
             painter.drawLine(QPointF(0.0, float(y)), QPointF(self.work_width, float(y)))
 
-        border_pen = QPen(QColor(46, 52, 64), 0)
-        border_pen.setWidthF(0)
-        painter.setPen(border_pen)
+        painter.setPen(QPen(QColor(46, 52, 64), 0))
         painter.drawRect(QRectF(0, 0, self.work_width, self.work_height))
 
         axis_pen = QPen(QColor(35, 130, 95), 0)
@@ -129,33 +335,32 @@ class LaserPreview(QWidget):
         painter.drawLine(QPointF(0.0, 0.0), QPointF(0.0, min(20.0, self.work_height)))
 
     def draw_text_items(self, painter):
+        painter.resetTransform()
         for index, item in enumerate(self.items):
-            if not item.text:
-                marker = QRectF(item.x - 0.8, item.y - 0.8, 1.6, 1.6)
-                painter.setPen(QPen(QColor(120, 126, 135), 0))
-                painter.drawEllipse(marker)
+            text = self.preview_text(item)
+            if not text:
                 continue
-
-            path = self.text_path(item)
             is_selected = index == self.selected_index
-            painter.setPen(QPen(QColor(25, 85, 150) if is_selected else QColor(42, 48, 58), 0))
-            painter.drawPath(path)
+            anchor = self.machine_to_screen(QPointF(item.x, item.y))
+            font = self.font_factory(item, self.size_getter() * self.scale_factor())
+            painter.setFont(font)
+            painter.setPen(QPen(QColor(25, 85, 150) if is_selected else QColor(42, 48, 58), 1))
+            painter.setLayoutDirection(Qt.LayoutDirection.LeftToRight if item.key in NUMERIC_KEYS else Qt.LayoutDirection.RightToLeft)
+            painter.drawText(anchor, text)
 
-            bounds = path.boundingRect()
+            bounds = self.item_bounds(item)
+            top_left = self.machine_to_screen(QPointF(bounds.left(), bounds.top()))
+            bottom_right = self.machine_to_screen(QPointF(bounds.right(), bounds.bottom()))
+            screen_bounds = QRectF(top_left, bottom_right).normalized()
             box_pen = QPen(QColor(225, 80, 68) if is_selected else QColor(137, 147, 161), 0)
             box_pen.setStyle(Qt.PenStyle.DashLine)
             painter.setPen(box_pen)
-            painter.drawRect(bounds)
+            painter.drawRect(screen_bounds.adjusted(-3, -3, 3, 3))
 
     def hit_test(self, screen_pos):
         machine_pos = self.screen_to_machine(screen_pos)
-        point_rect = QRectF(machine_pos.x() - 1.5, machine_pos.y() - 1.5, 3.0, 3.0)
         for index in reversed(range(len(self.items))):
-            item = self.items[index]
-            if item.text:
-                if self.text_path(item).boundingRect().adjusted(-1, -1, 1, 1).contains(machine_pos):
-                    return index
-            elif point_rect.contains(QPointF(item.x, item.y)):
+            if self.item_bounds(self.items[index]).adjusted(-1.5, -1.5, 1.5, 1.5).contains(machine_pos):
                 return index
         return None
 
@@ -187,12 +392,14 @@ class LaserPreview(QWidget):
 class LaserTextGCodeApp(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("تولید G-code حکاکی لیزر فارسی")
+        self.stroke_font = StrokeFont()
+        self.setWindowTitle("تولید G-code حکاکی لیزر با فونت خطی")
         self.items = [
             TextItem("first_name", "نام", "علی", 8.0, 42.0),
-            TextItem("last_name", "نام خانوادگی", "رضایی", 8.0, 32.0),
-            TextItem("card_number", "شماره کارت", "۶۰۳۷ ۹۹۷۵ ۱۲۳۴ ۵۶۷۸", 8.0, 18.0),
-            TextItem("extra", "توضیح", "", 8.0, 8.0),
+            TextItem("last_name", "نام خانوادگی", "رضایی", 8.0, 34.0),
+            TextItem("card_number", "شماره کارت", "6037 9975 1234 5678", 8.0, 23.0),
+            TextItem("expiry", "تاریخ انقضا", "12/29", 8.0, 13.0),
+            TextItem("cvv2", "CCV2", "123", 46.0, 13.0),
         ]
         self.text_fields = []
         self.x_fields = []
@@ -206,7 +413,7 @@ class LaserTextGCodeApp(QWidget):
 
         controls = QVBoxLayout()
         controls.addWidget(self.build_text_group())
-        controls.addWidget(self.build_font_group())
+        controls.addWidget(self.build_output_group())
         controls.addWidget(self.build_device_group())
         controls.addLayout(self.build_buttons())
 
@@ -218,9 +425,9 @@ class LaserTextGCodeApp(QWidget):
         controls.addWidget(self.gcode_text, stretch=1)
 
         preview_column = QVBoxLayout()
-        preview_label = QLabel("پیش‌نمایش خروجی لیزر - برای تغییر محل، متن را بکشید.")
+        preview_label = QLabel("پیش‌نمایش خروجی لیزر - متن‌ها خطی هستند و با ماوس جابه‌جا می‌شوند.")
         preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview = LaserPreview(self.items, self.current_font)
+        self.preview = LaserPreview(self.items, self.stroke_font, self.font_size, self.preview_font)
         self.preview.itemMoved.connect(self.on_preview_item_moved)
         self.preview.itemSelected.connect(self.on_preview_item_selected)
         preview_column.addWidget(preview_label)
@@ -229,17 +436,41 @@ class LaserTextGCodeApp(QWidget):
         main_layout.addLayout(controls, stretch=3)
         main_layout.addLayout(preview_column, stretch=4)
 
+    def display_font(self, item):
+        families = set(QFontDatabase.families())
+        if item.key in NUMERIC_KEYS:
+            family = NUMERIC_DISPLAY_FONT if NUMERIC_DISPLAY_FONT in families else "Arial"
+            return QFont(family, 11)
+        family = PERSIAN_DISPLAY_FONT if PERSIAN_DISPLAY_FONT in families else "Tahoma"
+        return QFont(family, 13)
+
+    def preview_font(self, item, size):
+        families = set(QFontDatabase.families())
+        if item.key in NUMERIC_KEYS:
+            family = NUMERIC_DISPLAY_FONT if NUMERIC_DISPLAY_FONT in families else "Arial"
+            font = QFont(family)
+            font.setPixelSize(max(1, int(size)))
+            return font
+        family = PERSIAN_DISPLAY_FONT if PERSIAN_DISPLAY_FONT in families else "Tahoma"
+        font = QFont(family)
+        font.setPixelSize(max(1, int(size)))
+        return font
+
+    def display_font_name(self, requested, fallback):
+        families = set(QFontDatabase.families())
+        return requested if requested in families else f"{fallback} (جایگزین {requested})"
+
     def build_text_group(self):
         group = QGroupBox("متن و موقعیت هر بخش")
         layout = QGridLayout()
-        headers = ["بخش", "متن", "X mm", "Y mm"]
-        for col, title in enumerate(headers):
+        for col, title in enumerate(["بخش", "متن", "X mm", "Y mm"]):
             layout.addWidget(QLabel(title), 0, col)
 
         for row, item in enumerate(self.items, start=1):
             label = QLabel(item.label)
             text_edit = QLineEdit(item.text)
-            text_edit.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+            text_edit.setLayoutDirection(Qt.LayoutDirection.RightToLeft if item.key not in NUMERIC_KEYS else Qt.LayoutDirection.LeftToRight)
+            text_edit.setFont(self.display_font(item))
             text_edit.textChanged.connect(self.refresh_data)
 
             x_spin = self.position_spin(item.x)
@@ -266,19 +497,14 @@ class LaserTextGCodeApp(QWidget):
         spin.valueChanged.connect(self.refresh_data)
         return spin
 
-    def build_font_group(self):
-        group = QGroupBox("تنظیمات فونت و خروجی")
+    def build_output_group(self):
+        group = QGroupBox("تنظیمات خروجی Marlin 2")
         layout = QFormLayout()
 
-        self.font_selector = QComboBox()
-        families = self.preferred_font_families()
-        self.font_selector.addItems(families)
-        self.font_selector.currentTextChanged.connect(self.refresh_data)
-
         self.font_size_spin = QDoubleSpinBox()
-        self.font_size_spin.setRange(4.0, 120.0)
-        self.font_size_spin.setValue(6.0)
-        self.font_size_spin.setSingleStep(0.5)
+        self.font_size_spin.setRange(1.0, 30.0)
+        self.font_size_spin.setValue(4.5)
+        self.font_size_spin.setSingleStep(0.25)
         self.font_size_spin.valueChanged.connect(self.refresh_data)
 
         self.work_width_spin = QDoubleSpinBox()
@@ -295,7 +521,7 @@ class LaserTextGCodeApp(QWidget):
 
         self.feed_rate_spin = QDoubleSpinBox()
         self.feed_rate_spin.setRange(10.0, 10000.0)
-        self.feed_rate_spin.setValue(900.0)
+        self.feed_rate_spin.setValue(700.0)
         self.feed_rate_spin.setSingleStep(50.0)
 
         self.travel_rate_spin = QDoubleSpinBox()
@@ -304,17 +530,19 @@ class LaserTextGCodeApp(QWidget):
         self.travel_rate_spin.setSingleStep(100.0)
 
         self.laser_power_spin = QDoubleSpinBox()
-        self.laser_power_spin.setRange(0.0, 1000.0)
-        self.laser_power_spin.setValue(450.0)
-        self.laser_power_spin.setSingleStep(25.0)
+        self.laser_power_spin.setRange(0.0, 255.0)
+        self.laser_power_spin.setValue(90.0)
+        self.laser_power_spin.setSingleStep(5.0)
 
-        layout.addRow("فونت:", self.font_selector)
-        layout.addRow("اندازه فونت:", self.font_size_spin)
+        layout.addRow("نمایش فارسی:", QLabel(f"{self.display_font_name(PERSIAN_DISPLAY_FONT, 'Tahoma')}"))
+        layout.addRow("نمایش اعداد:", QLabel(f"{self.display_font_name(NUMERIC_DISPLAY_FONT, 'Arial')}"))
+        layout.addRow("G-code:", QLabel("Vector outline از همان فونت‌های UI"))
+        layout.addRow("اندازه متن mm:", self.font_size_spin)
         layout.addRow("عرض ناحیه کار mm:", self.work_width_spin)
         layout.addRow("ارتفاع ناحیه کار mm:", self.work_height_spin)
-        layout.addRow("سرعت حکاکی:", self.feed_rate_spin)
-        layout.addRow("سرعت حرکت آزاد:", self.travel_rate_spin)
-        layout.addRow("قدرت لیزر S:", self.laser_power_spin)
+        layout.addRow("سرعت حکاکی F:", self.feed_rate_spin)
+        layout.addRow("سرعت حرکت آزاد F:", self.travel_rate_spin)
+        layout.addRow("قدرت لیزر S برای Marlin:", self.laser_power_spin)
         group.setLayout(layout)
         return group
 
@@ -322,11 +550,16 @@ class LaserTextGCodeApp(QWidget):
         group = QGroupBox("ارسال به دستگاه")
         layout = QFormLayout()
 
-        self.com_port_edit = QLineEdit("COM3")
-        self.com_port_edit.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
-        self.baud_spin = QSpinBox()
-        self.baud_spin.setRange(300, 250000)
-        self.baud_spin.setValue(115200)
+        self.port_combo = QComboBox()
+        self.port_combo.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+        self.refresh_ports_button = QPushButton("بازخوانی پورت‌ها")
+        self.refresh_ports_button.clicked.connect(self.refresh_serial_ports)
+
+        self.baud_combo = QComboBox()
+        self.baud_combo.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+        for baud in STANDARD_BAUD_RATES:
+            self.baud_combo.addItem(str(baud), baud)
+        self.baud_combo.setCurrentText("115200")
 
         self.send_button = QPushButton("ارسال به دستگاه")
         self.send_button.clicked.connect(self.on_send)
@@ -336,11 +569,13 @@ class LaserTextGCodeApp(QWidget):
         self.device_status = QLabel(status)
         self.device_status.setWordWrap(True)
 
-        layout.addRow("پورت:", self.com_port_edit)
-        layout.addRow("Baud:", self.baud_spin)
+        layout.addRow("پورت:", self.port_combo)
+        layout.addRow("", self.refresh_ports_button)
+        layout.addRow("Baud:", self.baud_combo)
         layout.addRow(self.send_button)
         layout.addRow(self.device_status)
         group.setLayout(layout)
+        self.refresh_serial_ports()
         return group
 
     def build_buttons(self):
@@ -353,28 +588,58 @@ class LaserTextGCodeApp(QWidget):
         layout.addWidget(self.save_button)
         return layout
 
-    def preferred_font_families(self):
-        families = QFontDatabase.families()
-        keywords = ["B ", "Nazanin", "Mitra", "Yekan", "Iran", "Vazir", "Sahel", "Shabnam", "Tahoma", "Arial"]
-        filtered = [family for family in families if any(k.lower() in family.lower() for k in keywords)]
-        return filtered or families
+    def refresh_serial_ports(self):
+        if list_ports is None:
+            self.port_combo.clear()
+            self.port_combo.addItem("pyserial نصب نیست", "")
+            self.port_combo.setEnabled(False)
+            self.baud_combo.setEnabled(False)
+            self.refresh_ports_button.setEnabled(False)
+            return
 
-    def current_font(self):
-        font_name = self.font_selector.currentText() if hasattr(self, "font_selector") else "Tahoma"
-        font = QFont(font_name)
-        font.setPixelSize(max(1, int(self.font_size_spin.value())))
-        font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
-        return font
+        current_port = self.port_combo.currentData() if self.port_combo.count() else None
+        self.port_combo.clear()
+        ports = list(list_ports.comports())
+        for port in ports:
+            label = f"{port.device} - {port.description}"
+            self.port_combo.addItem(label, port.device)
+
+        if not ports:
+            self.port_combo.addItem("پورتی پیدا نشد", "")
+            self.port_combo.setEnabled(False)
+            self.baud_combo.setEnabled(False)
+            self.send_button.setEnabled(False)
+            self.device_status.setText("هیچ پورت سریال فعالی پیدا نشد.")
+            return
+
+        self.port_combo.setEnabled(True)
+        self.baud_combo.setEnabled(True)
+        self.send_button.setEnabled(serial is not None)
+        if current_port:
+            index = self.port_combo.findData(current_port)
+            if index >= 0:
+                self.port_combo.setCurrentIndex(index)
+        self.device_status.setText(f"{len(ports)} پورت سریال پیدا شد.")
+
+    def font_size(self):
+        return self.font_size_spin.value()
 
     def refresh_data(self):
         for index, item in enumerate(self.items):
-            item.text = self.text_fields[index].text().strip()
+            text = self.text_fields[index].text().strip()
+            if item.key in NUMERIC_KEYS:
+                text = self.stroke_font.normalize(text, numeric=True)
+                if text != self.text_fields[index].text():
+                    self.text_fields[index].blockSignals(True)
+                    self.text_fields[index].setText(text)
+                    self.text_fields[index].blockSignals(False)
+            item.text = text
             item.x = self.x_fields[index].value()
             item.y = self.y_fields[index].value()
 
         if hasattr(self, "preview"):
             self.preview.set_work_area(self.work_width_spin.value(), self.work_height_spin.value())
-            self.preview.update_preview()
+            self.preview.update()
 
     def on_preview_item_selected(self, index):
         self.preview.set_selected_index(index)
@@ -389,53 +654,114 @@ class LaserTextGCodeApp(QWidget):
         self.y_fields[index].blockSignals(False)
         self.items[index].x = x
         self.items[index].y = y
-        self.preview.update_preview()
+        self.preview.update()
 
-    def build_text_paths(self):
+    def build_strokes(self):
+        size = self.font_size()
         shapes = []
-        font = self.current_font()
         for item in self.items:
             if not item.text:
                 continue
-            path = QPainterPath()
-            path.addText(item.x, item.y, font, item.text)
-            polygons = path.toSubpathPolygons()
-            shapes.append((item.key, polygons))
+            strokes = self.stroke_font.strokes_for_text(
+                item.text,
+                item.x,
+                item.y,
+                size,
+                numeric=item.key in NUMERIC_KEYS,
+            )
+            shapes.append((item.key, strokes))
         return shapes
 
+    def build_font_outline_paths(self):
+        shapes = []
+        for item in self.items:
+            path = self.font_outline_path_for_item(item)
+            polygons = path.toSubpathPolygons()
+            if polygons:
+                shapes.append((item.key, polygons))
+        return shapes
+
+    def font_outline_path_for_item(self, item):
+        text = self.stroke_font.normalize(item.text, numeric=item.key in NUMERIC_KEYS)
+        path = QPainterPath()
+        if not text:
+            return path
+
+        px_per_mm = 20.0
+        font = self.preview_font(item, self.font_size() * px_per_mm)
+
+        option = QTextOption()
+        option.setTextDirection(Qt.LayoutDirection.LeftToRight if item.key in NUMERIC_KEYS else Qt.LayoutDirection.RightToLeft)
+
+        layout = QTextLayout(text, font)
+        layout.setTextOption(option)
+        layout.beginLayout()
+        line = layout.createLine()
+        line.setLineWidth(10000)
+        layout.endLayout()
+
+        raw_path = QPainterPath()
+        for glyph_run in layout.glyphRuns():
+            raw_font = glyph_run.rawFont()
+            for glyph_index, position in zip(glyph_run.glyphIndexes(), glyph_run.positions()):
+                glyph_path = raw_font.pathForGlyph(glyph_index)
+                raw_path.addPath(glyph_path.translated(position))
+
+        bounds = raw_path.boundingRect()
+        if bounds.isEmpty():
+            return path
+
+        for polygon in raw_path.toSubpathPolygons():
+            if polygon.isEmpty():
+                continue
+            machine_polygon = []
+            for point in polygon:
+                x = item.x + (point.x() - bounds.left()) / px_per_mm
+                y = item.y - (point.y() - bounds.bottom()) / px_per_mm
+                machine_polygon.append(QPointF(x, y))
+            if machine_polygon:
+                path.moveTo(machine_polygon[0])
+                for point in machine_polygon[1:]:
+                    path.lineTo(point)
+                path.closeSubpath()
+        return path
+
     def generate_gcode(self):
+        self.refresh_data()
         feed_rate = self.feed_rate_spin.value()
         travel_rate = self.travel_rate_spin.value()
         power = self.laser_power_spin.value()
 
         lines = [
             "(Generated by laser_text_gcode.py)",
+            "(Target firmware: Marlin 2 laser mode)",
+            "(Mode: vector outlines from displayed fonts)",
+            "(Fonts: B Nazanin for Persian, Calibri for numeric fields)",
             "G21 ; units in millimeters",
             "G90 ; absolute positioning",
-            "M05 ; laser off",
+            "M5 ; laser off",
             f"G0 F{travel_rate:.0f}",
         ]
 
-        for label, polygons in self.build_text_paths():
+        for label, polygons in self.build_font_outline_paths():
             lines.append(f"(Text: {label})")
             for polygon in polygons:
                 if polygon.isEmpty():
                     continue
                 start = polygon[0]
                 lines.append(f"G0 X{start.x():.3f} Y{start.y():.3f}")
-                lines.append(f"M03 S{power:.0f}")
+                lines.append(f"M3 S{power:.0f}")
                 lines.append(f"G1 F{feed_rate:.0f}")
                 for point in polygon[1:]:
                     lines.append(f"G1 X{point.x():.3f} Y{point.y():.3f}")
                 lines.append(f"G1 X{start.x():.3f} Y{start.y():.3f}")
-                lines.append("M05")
+                lines.append("M5")
             lines.append("")
 
-        lines.extend(["M05", "G0 X0 Y0", "M30"])
+        lines.extend(["M5", "G0 X0 Y0", "M400"])
         return "\n".join(lines)
 
     def on_generate(self):
-        self.refresh_data()
         self.gcode_text.setPlainText(self.generate_gcode())
 
     def on_save(self):
@@ -458,23 +784,74 @@ class LaserTextGCodeApp(QWidget):
 
         gcode = self.gcode_text.toPlainText().strip() or self.generate_gcode()
         self.gcode_text.setPlainText(gcode)
-        port = self.com_port_edit.text().strip()
-        baud = self.baud_spin.value()
+        port = self.port_combo.currentData()
+        baud = self.baud_combo.currentData()
+        if not port:
+            QMessageBox.warning(self, "پورت انتخاب نشده", "هیچ پورت سریالی برای ارسال انتخاب نشده است.")
+            return
 
         try:
-            with serial.Serial(port, baudrate=baud, timeout=2) as ser:
+            with serial.Serial(port, baudrate=baud, timeout=3) as ser:
                 time.sleep(2.0)
                 ser.reset_input_buffer()
-                for line in gcode.splitlines():
-                    command = line.strip()
-                    if not command:
-                        continue
-                    ser.write((command + "\n").encode("ascii", errors="ignore"))
-                    ser.readline()
+                self.wait_for_controller_ready(ser)
+                commands = self.serial_commands(gcode)
+                for index, command in enumerate(commands, start=1):
+                    self.send_command_and_wait_ok(ser, command)
+                    if index % 25 == 0:
+                        self.device_status.setText(f"ارسال: {index} از {len(commands)} خط")
+                        QApplication.processEvents()
+                self.send_command_and_wait_ok(ser, "M400")
+                self.send_command_and_wait_ok(ser, "M5")
                 ser.flush()
             self.device_status.setText(f"G-code با موفقیت به {port} ارسال شد.")
         except Exception as exc:
             self.device_status.setText(f"خطا در ارسال: {exc}")
+
+    def serial_commands(self, gcode):
+        commands = []
+        for line in gcode.splitlines():
+            command = line.strip()
+            if not command or command.startswith(";") or command.startswith("("):
+                continue
+            if ";" in command:
+                command = command.split(";", 1)[0].strip()
+            if command:
+                commands.append(command)
+        return commands
+
+    def wait_for_controller_ready(self, ser):
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            waiting = ser.readline().decode("ascii", errors="ignore").strip().lower()
+            if waiting.startswith("start") or waiting.startswith("ok"):
+                return
+        ser.write(b"\n")
+        ser.flush()
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            response = ser.readline().decode("ascii", errors="ignore").strip().lower()
+            if response.startswith("ok"):
+                return
+
+    def send_command_and_wait_ok(self, ser, command):
+        ser.write((command + "\n").encode("ascii", errors="ignore"))
+        ser.flush()
+
+        deadline = time.time() + 20.0
+        while time.time() < deadline:
+            response = ser.readline().decode("ascii", errors="ignore").strip()
+            if not response:
+                continue
+            lower = response.lower()
+            if lower.startswith("ok"):
+                return
+            if lower.startswith("error") or "resend" in lower:
+                raise RuntimeError(f"Marlin rejected '{command}': {response}")
+            if "busy:" in lower:
+                deadline = time.time() + 20.0
+                continue
+        raise TimeoutError(f"پاسخ ok از دستگاه دریافت نشد: {command}")
 
 
 def main():
