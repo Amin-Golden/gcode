@@ -1,6 +1,8 @@
 import sys
 import time
 from dataclasses import dataclass
+from math import hypot
+import re
 
 from PyQt6.QtCore import QPointF, QRectF, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QFontDatabase, QFontMetricsF, QPainter, QPainterPath, QPen, QTextLayout, QTextOption
@@ -16,6 +18,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSizePolicy,
     QSpinBox,
@@ -34,9 +37,13 @@ except ImportError:
 
 PERSIAN_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
 PERSIAN_LETTERS = set("اآبپتثجچحخدذرزژسشصضطظعغفقکگلمنوهیيكة")
-NUMERIC_KEYS = {"card_number", "expiry", "cvv2"}
+NUMERIC_KEYS = {"iban", "card_number", "expiry", "cvv2"}
 PERSIAN_DISPLAY_FONT = "B Nazanin"
 NUMERIC_DISPLAY_FONT = "Calibri"
+MACHINE_WIDTH_MM = 105.0
+MACHINE_HEIGHT_MM = 90.0
+CARD_ORIGIN_X_MM = 0.0
+CARD_ORIGIN_Y_MM = 30.0
 STANDARD_BAUD_RATES = [
     300,
     600,
@@ -204,8 +211,8 @@ class StrokeFont:
         text = text.translate(PERSIAN_DIGITS)
         text = text.replace("ي", "ی").replace("ك", "ک").replace("ة", "ه")
         if numeric:
-            allowed = set("0123456789 /-:.")
-            return "".join(char for char in text if char in allowed)
+            allowed = set("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ /-:.")
+            return "".join(char.upper() for char in text if char.upper() in allowed)
         return text
 
     def visual_chars(self, text, numeric=False):
@@ -397,9 +404,10 @@ class LaserTextGCodeApp(QWidget):
         self.items = [
             TextItem("first_name", "نام", "علی", 8.0, 42.0),
             TextItem("last_name", "نام خانوادگی", "رضایی", 8.0, 34.0),
-            TextItem("card_number", "شماره کارت", "6037 9975 1234 5678", 8.0, 23.0),
-            TextItem("expiry", "تاریخ انقضا", "12/29", 8.0, 13.0),
-            TextItem("cvv2", "CCV2", "123", 46.0, 13.0),
+            TextItem("iban", "شماره شبا", "IR 12 3456 7890 1234 5678 9012 34", 8.0, 26.0),
+            TextItem("card_number", "شماره کارت", "6037 9975 1234 5678", 8.0, 19.0),
+            TextItem("expiry", "تاریخ انقضا", "12/29", 8.0, 10.0),
+            TextItem("cvv2", "CCV2", "123", 46.0, 10.0),
         ]
         self.text_fields = []
         self.x_fields = []
@@ -498,7 +506,7 @@ class LaserTextGCodeApp(QWidget):
         return spin
 
     def build_output_group(self):
-        group = QGroupBox("تنظیمات خروجی Marlin 2")
+        group = QGroupBox("تنظیمات خروجی GRBL-M3")
         layout = QFormLayout()
 
         self.font_size_spin = QDoubleSpinBox()
@@ -538,11 +546,13 @@ class LaserTextGCodeApp(QWidget):
         layout.addRow("نمایش اعداد:", QLabel(f"{self.display_font_name(NUMERIC_DISPLAY_FONT, 'Arial')}"))
         layout.addRow("G-code:", QLabel("Vector outline از همان فونت‌های UI"))
         layout.addRow("اندازه متن mm:", self.font_size_spin)
-        layout.addRow("عرض ناحیه کار mm:", self.work_width_spin)
-        layout.addRow("ارتفاع ناحیه کار mm:", self.work_height_spin)
+        layout.addRow("عرض کارت mm:", self.work_width_spin)
+        layout.addRow("ارتفاع کارت mm:", self.work_height_spin)
         layout.addRow("سرعت حکاکی F:", self.feed_rate_spin)
         layout.addRow("سرعت حرکت آزاد F:", self.travel_rate_spin)
-        layout.addRow("قدرت لیزر S برای Marlin:", self.laser_power_spin)
+        layout.addRow("Transfer mode:", QLabel("buffered"))
+        layout.addRow("S-value max:", QLabel("255"))
+        layout.addRow("قدرت لیزر S برای GRBL:", self.laser_power_spin)
         group.setLayout(layout)
         return group
 
@@ -568,10 +578,16 @@ class LaserTextGCodeApp(QWidget):
         status = "pySerial آماده است." if serial is not None else "pySerial نصب نیست؛ فقط ذخیره فایل فعال است."
         self.device_status = QLabel(status)
         self.device_status.setWordWrap(True)
+        self.estimated_time_label = QLabel("زمان تخمینی: -")
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
 
         layout.addRow("پورت:", self.port_combo)
         layout.addRow("", self.refresh_ports_button)
         layout.addRow("Baud:", self.baud_combo)
+        layout.addRow(self.estimated_time_label)
+        layout.addRow(self.progress_bar)
         layout.addRow(self.send_button)
         layout.addRow(self.device_status)
         group.setLayout(layout)
@@ -582,9 +598,12 @@ class LaserTextGCodeApp(QWidget):
         layout = QHBoxLayout()
         self.generate_button = QPushButton("تولید G-code")
         self.generate_button.clicked.connect(self.on_generate)
+        self.card_outline_button = QPushButton("تست مستطیل کارت")
+        self.card_outline_button.clicked.connect(self.on_card_outline_test)
         self.save_button = QPushButton("ذخیره فایل")
         self.save_button.clicked.connect(self.on_save)
         layout.addWidget(self.generate_button)
+        layout.addWidget(self.card_outline_button)
         layout.addWidget(self.save_button)
         return layout
 
@@ -726,46 +745,144 @@ class LaserTextGCodeApp(QWidget):
                 path.closeSubpath()
         return path
 
+    def rotate_output_point(self, point):
+        return QPointF(
+            CARD_ORIGIN_X_MM + self.work_width_spin.value() - point.x(),
+            CARD_ORIGIN_Y_MM + self.work_height_spin.value() - point.y(),
+        )
+
+    def card_machine_rect_points(self):
+        x0 = CARD_ORIGIN_X_MM
+        y0 = CARD_ORIGIN_Y_MM
+        x1 = x0 + self.work_width_spin.value()
+        y1 = y0 + self.work_height_spin.value()
+        return [
+            QPointF(x0, y0),
+            QPointF(x1, y0),
+            QPointF(x1, y1),
+            QPointF(x0, y1),
+            QPointF(x0, y0),
+        ]
+
+    def gcode_header(self):
+        return [
+            "(Generated by laser_text_gcode.py)",
+            "(Target firmware: GRBL-M3)",
+            "(Transfer mode: buffered)",
+            "(S-value max: 255)",
+            "(Mode: vector outlines from displayed fonts)",
+            "(Output rotation: 180 degrees)",
+            f"(Machine bed: {MACHINE_WIDTH_MM:.3f} x {MACHINE_HEIGHT_MM:.3f} mm)",
+            f"(Card origin: X{CARD_ORIGIN_X_MM:.3f} Y{CARD_ORIGIN_Y_MM:.3f})",
+            "(Fonts: B Nazanin for Persian, Calibri for numeric fields)",
+            "$H ; homing",
+            "G00 G17 G40 G21 G54",
+            "G90",
+            "M8",
+            "M5",
+            f"G0 X{CARD_ORIGIN_X_MM:.3f}Y{CARD_ORIGIN_Y_MM:.3f}",
+        ]
+
     def generate_gcode(self):
         self.refresh_data()
         feed_rate = self.feed_rate_spin.value()
         travel_rate = self.travel_rate_spin.value()
         power = self.laser_power_spin.value()
 
-        lines = [
-            "(Generated by laser_text_gcode.py)",
-            "(Target firmware: Marlin 2 laser mode)",
-            "(Mode: vector outlines from displayed fonts)",
-            "(Fonts: B Nazanin for Persian, Calibri for numeric fields)",
-            "G21 ; units in millimeters",
-            "G90 ; absolute positioning",
-            "M5 ; laser off",
-            f"G0 F{travel_rate:.0f}",
-        ]
+        lines = self.gcode_header()
 
         for label, polygons in self.build_font_outline_paths():
             lines.append(f"(Text: {label})")
             for polygon in polygons:
                 if polygon.isEmpty():
                     continue
-                start = polygon[0]
-                lines.append(f"G0 X{start.x():.3f} Y{start.y():.3f}")
-                lines.append(f"M3 S{power:.0f}")
-                lines.append(f"G1 F{feed_rate:.0f}")
+                start = self.rotate_output_point(polygon[0])
+                lines.append(f"G0 X{start.x():.3f}Y{start.y():.3f} F{travel_rate:.0f}")
+                lines.append("M3")
+                lines.append(f"G1 X{start.x():.3f}Y{start.y():.3f} S{power:.0f}F{feed_rate:.0f}")
                 for point in polygon[1:]:
-                    lines.append(f"G1 X{point.x():.3f} Y{point.y():.3f}")
-                lines.append(f"G1 X{start.x():.3f} Y{start.y():.3f}")
+                    rotated = self.rotate_output_point(point)
+                    lines.append(f"G1 X{rotated.x():.3f}Y{rotated.y():.3f}")
+                lines.append(f"G1 X{start.x():.3f}Y{start.y():.3f}")
                 lines.append("M5")
             lines.append("")
 
-        lines.extend(["M5", "G0 X0 Y0", "M400"])
+        lines.extend(["M9", "G1 S0", "G90", "$H ; homing"])
         return "\n".join(lines)
 
+    def generate_card_outline_test_gcode(self):
+        travel_rate = self.travel_rate_spin.value()
+        feed_rate = self.feed_rate_spin.value()
+        power = min(self.laser_power_spin.value(), 30.0)
+        points = self.card_machine_rect_points()
+
+        lines = self.gcode_header()
+        lines.append("(Card outline test)")
+        start = points[0]
+        lines.append(f"G0 X{start.x():.3f}Y{start.y():.3f} F{travel_rate:.0f}")
+        lines.append("M3")
+        lines.append(f"G1 X{start.x():.3f}Y{start.y():.3f} S{power:.0f}F{feed_rate:.0f}")
+        for point in points[1:]:
+            lines.append(f"G1 X{point.x():.3f}Y{point.y():.3f}")
+        lines.extend(["M5", "M9", "G1 S0", "G90", "$H ; homing"])
+        return "\n".join(lines)
+
+    def estimate_gcode_seconds(self, gcode):
+        current_x = 0.0
+        current_y = 0.0
+        current_feed = self.travel_rate_spin.value()
+        seconds = 0.0
+
+        for command in self.serial_commands(gcode):
+            match = re.search(r"\b(G0|G00|G1|G01)\b", command.upper())
+            code = match.group(1) if match else ""
+            params = self.gcode_params(command)
+            if "F" in params and params["F"] > 0:
+                current_feed = params["F"]
+            if code not in {"G0", "G00", "G1", "G01"}:
+                continue
+
+            target_x = params.get("X", current_x)
+            target_y = params.get("Y", current_y)
+            distance = hypot(target_x - current_x, target_y - current_y)
+            if current_feed > 0:
+                seconds += distance / current_feed * 60.0
+            current_x = target_x
+            current_y = target_y
+        return seconds
+
+    def gcode_params(self, command):
+        params = {}
+        for key, value in re.findall(r"([XYZFS])\s*(-?\d+(?:\.\d+)?)", command.upper()):
+            params[key] = float(value)
+        return params
+
+    def format_duration(self, seconds):
+        total = max(0, int(round(seconds)))
+        minutes, secs = divmod(total, 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            return f"{hours}:{minutes:02d}:{secs:02d}"
+        return f"{minutes}:{secs:02d}"
+
+    def update_estimated_time(self, gcode):
+        seconds = self.estimate_gcode_seconds(gcode)
+        self.estimated_time_label.setText(f"زمان تخمینی: {self.format_duration(seconds)}")
+        self.progress_bar.setValue(0)
+
     def on_generate(self):
-        self.gcode_text.setPlainText(self.generate_gcode())
+        gcode = self.generate_gcode()
+        self.gcode_text.setPlainText(gcode)
+        self.update_estimated_time(gcode)
+
+    def on_card_outline_test(self):
+        gcode = self.generate_card_outline_test_gcode()
+        self.gcode_text.setPlainText(gcode)
+        self.update_estimated_time(gcode)
 
     def on_save(self):
         gcode = self.gcode_text.toPlainText().strip() or self.generate_gcode()
+        self.update_estimated_time(gcode)
         path, _ = QFileDialog.getSaveFileName(
             self,
             "ذخیره G-code",
@@ -784,6 +901,8 @@ class LaserTextGCodeApp(QWidget):
 
         gcode = self.gcode_text.toPlainText().strip() or self.generate_gcode()
         self.gcode_text.setPlainText(gcode)
+        self.update_estimated_time(gcode)
+        self.progress_bar.setValue(0)
         port = self.port_combo.currentData()
         baud = self.baud_combo.currentData()
         if not port:
@@ -798,12 +917,13 @@ class LaserTextGCodeApp(QWidget):
                 commands = self.serial_commands(gcode)
                 for index, command in enumerate(commands, start=1):
                     self.send_command_and_wait_ok(ser, command)
-                    if index % 25 == 0:
-                        self.device_status.setText(f"ارسال: {index} از {len(commands)} خط")
+                    percent = int(index * 100 / max(1, len(commands)))
+                    self.progress_bar.setValue(percent)
+                    if index % 25 == 0 or index == len(commands):
+                        self.device_status.setText(f"ارسال: {index} از {len(commands)} خط ({percent}٪)")
                         QApplication.processEvents()
-                self.send_command_and_wait_ok(ser, "M400")
-                self.send_command_and_wait_ok(ser, "M5")
                 ser.flush()
+                self.progress_bar.setValue(100)
             self.device_status.setText(f"G-code با موفقیت به {port} ارسال شد.")
         except Exception as exc:
             self.device_status.setText(f"خطا در ارسال: {exc}")
@@ -838,7 +958,7 @@ class LaserTextGCodeApp(QWidget):
         ser.write((command + "\n").encode("ascii", errors="ignore"))
         ser.flush()
 
-        deadline = time.time() + 20.0
+        deadline = time.time() + (60.0 if command.startswith("$H") else 20.0)
         while time.time() < deadline:
             response = ser.readline().decode("ascii", errors="ignore").strip()
             if not response:
@@ -849,7 +969,7 @@ class LaserTextGCodeApp(QWidget):
             if lower.startswith("error") or "resend" in lower:
                 raise RuntimeError(f"Marlin rejected '{command}': {response}")
             if "busy:" in lower:
-                deadline = time.time() + 20.0
+                deadline = time.time() + (60.0 if command.startswith("$H") else 20.0)
                 continue
         raise TimeoutError(f"پاسخ ok از دستگاه دریافت نشد: {command}")
 
