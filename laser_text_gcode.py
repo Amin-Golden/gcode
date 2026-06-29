@@ -1,11 +1,35 @@
 import sys
 import time
 from dataclasses import dataclass
-from math import hypot
+from math import cos, hypot, pi, sin
 import re
 
+import numpy as np
+
+try:
+    from skimage.morphology import skeletonize
+    from scipy import ndimage
+
+    _HAS_SKIMAGE = True
+except ImportError:
+    skeletonize = None
+    ndimage = None
+    _HAS_SKIMAGE = False
+
 from PyQt6.QtCore import QPointF, QRectF, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QFontDatabase, QFontMetricsF, QPainter, QPainterPath, QPen, QTextLayout, QTextOption
+from PyQt6.QtGui import (
+    QColor,
+    QFont,
+    QFontDatabase,
+    QFontMetricsF,
+    QImage,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPolygonF,
+    QTextLayout,
+    QTextOption,
+)
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -62,6 +86,108 @@ STANDARD_BAUD_RATES = [
     500000,
     1000000,
 ]
+
+
+# Centerline extraction settings
+CENTERLINE_PX_PER_MM = 50.0      # raster resolution used for skeletonization
+CENTERLINE_PAD_PX = 6            # blank border around the rasterized glyph
+CENTERLINE_RDP_EPS_PX = 0.7      # polyline simplification tolerance in pixels
+CENTERLINE_SPUR_MM = 0.35        # prune skeleton branches shorter than this that hang off a junction
+CENTERLINE_NOISE_MM = 0.12       # drop tiny isolated fragments shorter than this (raster noise)
+DOT_MAX_MM = 1.4                 # connected components no larger than this may be Persian dots
+DOT_FILL_RATIO = 0.5             # ... and at least this solid (area / bbox area) to count as a dot
+DOT_MARK_RADIUS_MM = 0.18        # radius of the small circle engraved for each dot/spot
+DOT_MARK_SEGMENTS = 8            # number of segments used to trace that circle
+
+
+_NEIGHBOR_OFFSETS = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
+
+
+def _trace_skeleton(skel):
+    """Convert a 1px-thick boolean skeleton into a list of pixel polylines.
+
+    Returns a list of (points, deg_start, deg_end) where points is a list of
+    (col, row) float tuples and deg_* are the skeleton-graph degrees of the two
+    endpoints. Junctions (degree>=3) and endpoints (degree==1) break the
+    skeleton into separate strokes; the degrees let callers tell a real stroke
+    apart from a short spur branching off a junction.
+    """
+    rows, cols = np.nonzero(skel)
+    if len(rows) == 0:
+        return []
+
+    pixels = set(zip(rows.tolist(), cols.tolist()))
+    neighbors = {}
+    for r, c in pixels:
+        nb = [(r + dr, c + dc) for dr, dc in _NEIGHBOR_OFFSETS if (r + dr, c + dc) in pixels]
+        neighbors[(r, c)] = nb
+    degree = {p: len(nb) for p, nb in neighbors.items()}
+
+    visited = set()
+
+    def edge_key(a, b):
+        return (a, b) if a <= b else (b, a)
+
+    def walk(start, nxt):
+        line = [start]
+        prev, cur = start, nxt
+        while True:
+            line.append(cur)
+            visited.add(edge_key(prev, cur))
+            if degree[cur] != 2:
+                break
+            advanced = False
+            for nb in neighbors[cur]:
+                if nb != prev and edge_key(cur, nb) not in visited:
+                    prev, cur = cur, nb
+                    advanced = True
+                    break
+            if not advanced:
+                break
+        return line
+
+    polylines = []
+    # Start from endpoints and junctions first so degree-2 chains stay intact.
+    for node in (p for p in pixels if degree[p] != 2):
+        for nb in neighbors[node]:
+            if edge_key(node, nb) not in visited:
+                polylines.append(walk(node, nb))
+    # Remaining untouched edges belong to closed loops (every pixel degree 2).
+    for p in pixels:
+        for nb in neighbors[p]:
+            if edge_key(p, nb) not in visited:
+                polylines.append(walk(p, nb))
+
+    return [([(c, r) for r, c in line], degree[line[0]], degree[line[-1]]) for line in polylines]
+
+
+def _rdp(points, eps):
+    """Ramer-Douglas-Peucker polyline simplification on (x, y) tuples."""
+    if len(points) < 3:
+        return points
+    keep = [False] * len(points)
+    keep[0] = keep[-1] = True
+    stack = [(0, len(points) - 1)]
+    while stack:
+        start, end = stack.pop()
+        x1, y1 = points[start]
+        x2, y2 = points[end]
+        dx, dy = x2 - x1, y2 - y1
+        norm = hypot(dx, dy)
+        dmax, idx = 0.0, -1
+        for i in range(start + 1, end):
+            x0, y0 = points[i]
+            if norm == 0:
+                dist = hypot(x0 - x1, y0 - y1)
+            else:
+                dist = abs(dy * x0 - dx * y0 + x2 * y1 - y2 * x1) / norm
+            if dist > dmax:
+                dmax, idx = dist, i
+        if dmax > eps and idx != -1:
+            keep[idx] = True
+            stack.append((start, idx))
+            stack.append((idx, end))
+    return [points[i] for i, k in enumerate(keep) if k]
 
 
 @dataclass
@@ -250,12 +376,13 @@ class LaserPreview(QWidget):
     itemMoved = pyqtSignal(int, float, float)
     itemSelected = pyqtSignal(int)
 
-    def __init__(self, items, stroke_font, size_getter, font_factory, parent=None):
+    def __init__(self, items, stroke_font, size_getter, font_factory, centerline_provider=None, parent=None):
         super().__init__(parent)
         self.items = items
         self.stroke_font = stroke_font
         self.size_getter = size_getter
         self.font_factory = font_factory
+        self.centerline_provider = centerline_provider
         self.work_width = 86.0
         self.work_height = 54.0
         self.padding = 28
@@ -348,12 +475,29 @@ class LaserPreview(QWidget):
             if not text:
                 continue
             is_selected = index == self.selected_index
-            anchor = self.machine_to_screen(QPointF(item.x, item.y))
-            font = self.font_factory(item, self.size_getter() * self.scale_factor())
-            painter.setFont(font)
-            painter.setPen(QPen(QColor(25, 85, 150) if is_selected else QColor(42, 48, 58), 1))
-            painter.setLayoutDirection(Qt.LayoutDirection.LeftToRight if item.key in NUMERIC_KEYS else Qt.LayoutDirection.RightToLeft)
-            painter.drawText(anchor, text)
+
+            strokes = self.centerline_provider(item) if self.centerline_provider else None
+            if strokes:
+                stroke_pen = QPen(QColor(25, 85, 150) if is_selected else QColor(42, 48, 58), 1.4)
+                stroke_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                stroke_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+                painter.setPen(stroke_pen)
+                dot_color = QColor(25, 85, 150) if is_selected else QColor(42, 48, 58)
+                for stroke in strokes:
+                    if len(stroke) == 1:
+                        center = self.machine_to_screen(stroke[0])
+                        painter.setBrush(dot_color)
+                        painter.drawEllipse(center, 1.6, 1.6)
+                        painter.setBrush(Qt.BrushStyle.NoBrush)
+                        continue
+                    painter.drawPolyline(QPolygonF([self.machine_to_screen(point) for point in stroke]))
+            else:
+                anchor = self.machine_to_screen(QPointF(item.x, item.y))
+                font = self.font_factory(item, self.size_getter() * self.scale_factor())
+                painter.setFont(font)
+                painter.setPen(QPen(QColor(25, 85, 150) if is_selected else QColor(42, 48, 58), 1))
+                painter.setLayoutDirection(Qt.LayoutDirection.LeftToRight if item.key in NUMERIC_KEYS else Qt.LayoutDirection.RightToLeft)
+                painter.drawText(anchor, text)
 
             bounds = self.item_bounds(item)
             top_left = self.machine_to_screen(QPointF(bounds.left(), bounds.top()))
@@ -400,6 +544,7 @@ class LaserTextGCodeApp(QWidget):
     def __init__(self):
         super().__init__()
         self.stroke_font = StrokeFont()
+        self._centerline_cache = {}
         self.setWindowTitle("تولید G-code حکاکی لیزر با فونت خطی")
         self.items = [
             TextItem("first_name", "نام", "علی", 8.0, 42.0),
@@ -435,7 +580,7 @@ class LaserTextGCodeApp(QWidget):
         preview_column = QVBoxLayout()
         preview_label = QLabel("پیش‌نمایش خروجی لیزر - متن‌ها خطی هستند و با ماوس جابه‌جا می‌شوند.")
         preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview = LaserPreview(self.items, self.stroke_font, self.font_size, self.preview_font)
+        self.preview = LaserPreview(self.items, self.stroke_font, self.font_size, self.preview_font, self.centerline_paths_for_item)
         self.preview.itemMoved.connect(self.on_preview_item_moved)
         self.preview.itemSelected.connect(self.on_preview_item_selected)
         preview_column.addWidget(preview_label)
@@ -544,7 +689,7 @@ class LaserTextGCodeApp(QWidget):
 
         layout.addRow("نمایش فارسی:", QLabel(f"{self.display_font_name(PERSIAN_DISPLAY_FONT, 'Tahoma')}"))
         layout.addRow("نمایش اعداد:", QLabel(f"{self.display_font_name(NUMERIC_DISPLAY_FONT, 'Arial')}"))
-        layout.addRow("G-code:", QLabel("Vector outline از همان فونت‌های UI"))
+        layout.addRow("G-code:", QLabel("خط مرکزی تک‌حرکته (centerline) از همان فونت‌های UI"))
         layout.addRow("اندازه متن mm:", self.font_size_spin)
         layout.addRow("عرض کارت mm:", self.work_width_spin)
         layout.addRow("ارتفاع کارت mm:", self.work_height_spin)
@@ -700,13 +845,28 @@ class LaserTextGCodeApp(QWidget):
                 shapes.append((item.key, polygons))
         return shapes
 
-    def font_outline_path_for_item(self, item):
-        text = self.stroke_font.normalize(item.text, numeric=item.key in NUMERIC_KEYS)
-        path = QPainterPath()
-        if not text:
-            return path
+    def build_centerline_shapes(self):
+        """Single-stroke (pen-style) polylines for every item, in machine mm."""
+        shapes = []
+        for item in self.items:
+            if not item.text:
+                continue
+            strokes = self.centerline_paths_for_item(item)
+            if strokes:
+                shapes.append((item.key, strokes))
+        return shapes
 
-        px_per_mm = 20.0
+    def glyph_pixel_path(self, item, px_per_mm):
+        """Return the shaped glyph outline (QPainterPath) of an item in pixel space.
+
+        Qt performs Persian/Arabic shaping and joining here, so the resulting
+        outline already represents correctly connected cursive text.
+        """
+        text = self.stroke_font.normalize(item.text, numeric=item.key in NUMERIC_KEYS)
+        raw_path = QPainterPath()
+        if not text:
+            return raw_path, text
+
         font = self.preview_font(item, self.font_size() * px_per_mm)
 
         option = QTextOption()
@@ -719,13 +879,127 @@ class LaserTextGCodeApp(QWidget):
         line.setLineWidth(10000)
         layout.endLayout()
 
-        raw_path = QPainterPath()
         for glyph_run in layout.glyphRuns():
             raw_font = glyph_run.rawFont()
             for glyph_index, position in zip(glyph_run.glyphIndexes(), glyph_run.positions()):
                 glyph_path = raw_font.pathForGlyph(glyph_index)
                 raw_path.addPath(glyph_path.translated(position))
+        return raw_path, text
 
+    def centerline_relative(self, item):
+        """Single-stroke centerlines for an item, relative to its (x, y) anchor.
+
+        Returns a list of polylines (each a list of (dx, dy) offsets in mm).
+        Cached by (text, numeric flag, font size) because the skeleton only
+        depends on the shaped text, not on its position on the bed.
+        """
+        if not _HAS_SKIMAGE:
+            return None
+
+        text = self.stroke_font.normalize(item.text, numeric=item.key in NUMERIC_KEYS)
+        cache_key = (text, item.key in NUMERIC_KEYS, round(self.font_size(), 4))
+        cached = self._centerline_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        if not text:
+            self._centerline_cache[cache_key] = []
+            return []
+
+        ppm = CENTERLINE_PX_PER_MM
+        pad = CENTERLINE_PAD_PX
+        raw_path, _ = self.glyph_pixel_path(item, ppm)
+        raw_path.setFillRule(Qt.FillRule.WindingFill)
+        bounds = raw_path.boundingRect()
+        if bounds.isEmpty():
+            self._centerline_cache[cache_key] = []
+            return []
+
+        width_px = int(np.ceil(bounds.width())) + 2 * pad
+        height_px = int(np.ceil(bounds.height())) + 2 * pad
+
+        image = QImage(width_px, height_px, QImage.Format.Format_Grayscale8)
+        image.fill(0)
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(255, 255, 255))
+        painter.translate(pad - bounds.left(), pad - bounds.top())
+        painter.drawPath(raw_path)
+        painter.end()
+
+        stride = image.bytesPerLine()
+        buffer = image.constBits()
+        buffer.setsize(image.sizeInBytes())
+        arr = np.frombuffer(buffer, dtype=np.uint8).reshape((height_px, stride))[:, :width_px]
+        binary = arr > 127
+
+        bh = bounds.height()
+
+        def to_mm(col, row):
+            return ((col - pad) / ppm, (bh + pad - row) / ppm)
+
+        # Process each connected blob on its own so that small, solid components
+        # (Persian dots, hamza, the colon, the decimal point) survive as engraved
+        # spots instead of being pruned away with skeleton spurs.
+        labels, count = ndimage.label(binary, structure=np.ones((3, 3), dtype=int))
+        polylines = []
+        for label_id in range(1, count + 1):
+            component = labels == label_id
+            ys, xs = np.nonzero(component)
+            w_mm = (xs.max() - xs.min() + 1) / ppm
+            h_mm = (ys.max() - ys.min() + 1) / ppm
+            fill_ratio = component.sum() / max(1, (xs.max() - xs.min() + 1) * (ys.max() - ys.min() + 1))
+
+            if max(w_mm, h_mm) <= DOT_MAX_MM and fill_ratio >= DOT_FILL_RATIO:
+                # A dot/spot: engrave one point at its centroid.
+                polylines.append([to_mm(xs.mean(), ys.mean())])
+                continue
+
+            skeleton = skeletonize(component)
+            for line, deg_a, deg_b in _trace_skeleton(skeleton):
+                line = _rdp(line, CENTERLINE_RDP_EPS_PX)
+                stroke = [to_mm(col, row) for col, row in line]
+                if len(stroke) < 2:
+                    continue
+                length = sum(
+                    hypot(stroke[i + 1][0] - stroke[i][0], stroke[i + 1][1] - stroke[i][1])
+                    for i in range(len(stroke) - 1)
+                )
+                is_spur = (deg_a >= 3 or deg_b >= 3) and min(deg_a, deg_b) == 1 and length < CENTERLINE_SPUR_MM
+                if is_spur or length < CENTERLINE_NOISE_MM:
+                    continue
+                polylines.append(stroke)
+
+        self._centerline_cache[cache_key] = polylines
+        return polylines
+
+    def centerline_paths_for_item(self, item):
+        """Centerline strokes placed at the item's machine position (list of QPointF lists)."""
+        relative = self.centerline_relative(item)
+        if not relative:
+            return []
+        return [[QPointF(item.x + dx, item.y + dy) for dx, dy in stroke] for stroke in relative]
+
+    @staticmethod
+    def dot_mark_points(center):
+        """A small closed circle (list of QPointF) used to engrave a single dot."""
+        cx, cy = center.x(), center.y()
+        return [
+            QPointF(
+                cx + DOT_MARK_RADIUS_MM * cos(2 * pi * k / DOT_MARK_SEGMENTS),
+                cy + DOT_MARK_RADIUS_MM * sin(2 * pi * k / DOT_MARK_SEGMENTS),
+            )
+            for k in range(DOT_MARK_SEGMENTS + 1)
+        ]
+
+    def font_outline_path_for_item(self, item):
+        ppm = 20.0
+        raw_path, text = self.glyph_pixel_path(item, ppm)
+        path = QPainterPath()
+        if not text:
+            return path
+
+        px_per_mm = ppm
         bounds = raw_path.boundingRect()
         if bounds.isEmpty():
             return path
@@ -770,7 +1044,7 @@ class LaserTextGCodeApp(QWidget):
             "(Target firmware: GRBL-M3)",
             "(Transfer mode: buffered)",
             "(S-value max: 255)",
-            "(Mode: vector outlines from displayed fonts)",
+            "(Mode: single-stroke centerlines from displayed fonts)",
             "(Output rotation: 180 degrees)",
             f"(Machine bed: {MACHINE_WIDTH_MM:.3f} x {MACHINE_HEIGHT_MM:.3f} mm)",
             f"(Card origin: X{CARD_ORIGIN_X_MM:.3f} Y{CARD_ORIGIN_Y_MM:.3f})",
@@ -791,19 +1065,33 @@ class LaserTextGCodeApp(QWidget):
 
         lines = self.gcode_header()
 
-        for label, polygons in self.build_font_outline_paths():
+        if not _HAS_SKIMAGE:
+            lines.append("(WARNING: scikit-image not installed, falling back to hollow outlines)")
+            shapes = self.build_font_outline_paths()
+            close_stroke = True
+        else:
+            shapes = self.build_centerline_shapes()
+            close_stroke = False
+
+        for label, strokes in shapes:
             lines.append(f"(Text: {label})")
-            for polygon in polygons:
-                if polygon.isEmpty():
+            for stroke in strokes:
+                if not stroke:
                     continue
-                start = self.rotate_output_point(polygon[0])
+                if len(stroke) == 1:
+                    # A dot/spot: engrave a tiny circle so it is a real, visible
+                    # moving toolpath that reliably burns (a zero-length dwell is
+                    # invisible in viewers and may not fire the laser).
+                    stroke = self.dot_mark_points(stroke[0])
+                start = self.rotate_output_point(stroke[0])
                 lines.append(f"G0 X{start.x():.3f}Y{start.y():.3f} F{travel_rate:.0f}")
                 lines.append("M3")
                 lines.append(f"G1 X{start.x():.3f}Y{start.y():.3f} S{power:.0f}F{feed_rate:.0f}")
-                for point in polygon[1:]:
+                for point in stroke[1:]:
                     rotated = self.rotate_output_point(point)
                     lines.append(f"G1 X{rotated.x():.3f}Y{rotated.y():.3f}")
-                lines.append(f"G1 X{start.x():.3f}Y{start.y():.3f}")
+                if close_stroke:
+                    lines.append(f"G1 X{start.x():.3f}Y{start.y():.3f}")
                 lines.append("M5")
             lines.append("")
 
